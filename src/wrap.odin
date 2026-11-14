@@ -54,6 +54,7 @@ wrap_ex :: proc(e: ^Encoder, timeout_ms: u32, info: ^WrapInfo) -> ErrorCode {
 	info^ = WrapInfo {
 		solved_family = -1,
 	}
+	fam_buf: [16]u8
 
 	if e.frozen {
 		info.message = fmt.aprintf("wrap: 编码器已 frozen，拒绝修改")
@@ -149,20 +150,20 @@ wrap_ex :: proc(e: ^Encoder, timeout_ms: u32, info: ^WrapInfo) -> ErrorCode {
 	case info.timed_out:
 		info.message = fmt.aprintf(
 			"wrap: 超时（总预算 %d ms），已尝试 family %s；未找到可 verify 的解",
-			timeout_ms, tried_families_string(info),
+			timeout_ms, tried_families_string(info, fam_buf[:]),
 		)
 		return .Timeout
 	case info.missing_z3:
 		info.message = fmt.aprintf(
 			"wrap: Z3 动态库不可用（libz3.dll 未找到），family 1..3 未尝试；安装 Z3 后重试。已尝试 family %s",
-			tried_families_string(info),
+			tried_families_string(info, fam_buf[:]),
 		)
 		return .MissingZ3
 	}
 
 	message := fmt.aprintf(
 		"wrap: 所有 family 均无解（Infeasible），已尝试 family %s；样本数 %d，字符数 %d",
-		tried_families_string(info), len(e.entries), CHAR_COUNT,
+		tried_families_string(info, fam_buf[:]), len(e.entries), CHAR_COUNT,
 	)
 	if len(e.entries) > CHAR_COUNT {
 		message = fmt.aprintf(
@@ -186,8 +187,7 @@ elapsed_ms :: proc(start: time.Tick) -> i64 {
 }
 
 @(private)
-tried_families_string :: proc(info: ^WrapInfo) -> string {
-	buf: [32]u8
+tried_families_string :: proc(info: ^WrapInfo, buf: []u8) -> string {
 	n := 0
 	for i in 0 ..< 4 {
 		if info.families_tried[i] {
@@ -202,7 +202,7 @@ tried_families_string :: proc(info: ^WrapInfo) -> string {
 	if n == 0 {
 		return "none"
 	}
-	return fmt.aprintf("%s", string(buf[:n]))
+	return string(buf[:n])
 }
 
 /*
@@ -486,4 +486,5 @@ z3_release :: proc(api: Z3_API, ctx: Z3_context, solver: Z3_solver, opt: Z3_opti
 		api.Z3_optimize_dec_ref(ctx, opt)
 	}
 }
+
 
