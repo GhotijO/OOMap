@@ -1,0 +1,23 @@
+# Build output
+/bin/
+*.exe
+*.pdb
+*.obj
+*.ilk
+
+# Prebuilt Z3 binaries (fetch with scripts/fetch_z3.ps1)
+/lib/*.dll
+/lib/*.lib
+/lib/*.pdb
+
+# Generated test data / temporary files
+/test.csv
+*.hidden
+*.tmp
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
