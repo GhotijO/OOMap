@@ -244,15 +244,26 @@ entries_from_cache :: proc(cache: []u32) -> (entries: [dynamic]Entry, err: Error
 		case FRAME_START:
 			key, next, ok := parse_framed_entry(cache, pos)
 			if !ok {
+				free_entry_list(&entries)
 				return entries, .InternalError
 			}
 			append(&entries, Entry{key = key, head = u32(pos)})
 			pos = next
 		case:
+			free_entry_list(&entries)
 			return entries, .InternalError
 		}
 	}
 	return entries, .None
+}
+
+@(private)
+free_entry_list :: proc(entries: ^[dynamic]Entry) {
+	for entry in entries^ {
+		delete(entry.key)
+	}
+	delete(entries^)
+	entries^ = nil
 }
 
 @(private)

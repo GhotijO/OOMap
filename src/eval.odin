@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 // 64 字符地址编码器 —— 字符集、求值与校验
 //
@@ -170,6 +170,10 @@ read_segment_legacy :: proc(cache: []u32, key: string, head: int) -> (data: []u8
 	if data_words < 0 || pos + data_words > len(cache) {
 		return nil, false
 	}
+	end := pos + data_words
+	if end >= len(cache) || cache[end] != SEGMENT_SEPARATOR {
+		return nil, false
+	}
 	return unpack_words(cache, pos, data_words), true
 }
 
@@ -199,6 +203,10 @@ read_segment_framed :: proc(cache: []u32, key: string, head: int) -> (data: []u8
 	}
 	pos += 1
 	if data_words < 0 || pos + data_words > len(cache) {
+		return nil, false
+	}
+	end := pos + data_words
+	if end >= len(cache) || cache[end] != FRAME_END {
 		return nil, false
 	}
 	return unpack_words(cache, pos, data_words), true

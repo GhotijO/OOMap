@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 // 64 字符地址编码器 —— 验收测试
 //
@@ -263,6 +263,27 @@ test_entries_from_cache :: proc(t: ^testing.T) {
 		delete(entry.key)
 	}
 	delete(entries)
+}
+
+// ---------------------------------------------------------------- 2d. 64 字符全参与
+
+@(test)
+test_all_chars_underdetermined :: proc(t: ^testing.T) {
+	e := encoder_init()
+	defer encoder_destroy(&e)
+
+	// 一个覆盖全部 64 个字符的 key：方程欠定（1 条样本、64 个变量），
+	// 用来覆盖 m=64 时的 family 0 回退路径。
+	k, _ := strings.clone(SIGMA)
+	append(&e.entries, Entry{key = k, head = u32(X0) + 42})
+
+	info: WrapInfo
+	err := wrap_ex(&e, 5_000, &info)
+	defer wrap_info_destroy(&info)
+	testing.expect_value(t, err, ErrorCode.None)
+	testing.expect_value(t, info.solved_family, 0)
+	ok, _ := verify(&e)
+	testing.expect(t, ok)
 }
 
 // ---------------------------------------------------------------- 3. 不可行测试

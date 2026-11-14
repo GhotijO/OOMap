@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 // test.csv 端到端测试：
 //   - 读取程序同目录（也兼容当前目录 / bin 目录）下的 test.csv；
@@ -168,8 +168,8 @@ run_csv_test :: proc() -> bool {
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
-		// 可选表头
-		if rows == 0 && (strings.has_prefix(line, "key") || strings.has_prefix(line, "字符串")) {
+		// 只接受精确的表头文本，避免把以 "key..." 开头的真实 key 误判为表头。
+		if rows == 0 && (line == "key,hex" || line == "字符串,十六进制数据") {
 			continue
 		}
 

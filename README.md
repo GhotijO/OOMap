@@ -58,6 +58,7 @@ OOMap/
 ├── build.bat / build.sh
 ├── .gitignore / .gitattributes
 ├── LICENSE                 MIT
+├── RELEASE.md              GitHub Release 描述（v1.0.0）
 └── README.md
 ```
 
@@ -289,6 +290,14 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 - 目前只在 Windows x64 + Odin `dev-2026-10-nightly` + Z3 5.3.3 上实测；Linux/macOS
   的加载路径已写好（`libz3.so` / `libz3.dylib`），但未在真机验证。
 - `verify` 只做语义校验（mode ∈ 0..3），不校验 family 归属，符合第 8 节约定。
+- 超时预算只在 family 边界检查；family 0 是同步求解，极端大的输入可能在返回
+  `.Timeout` 前多跑一点时间。
+- 两种段格式都只记录 `u32` 字数，不记录原始字节数，因此 `read_data` 返回的是
+  4 字节对齐的数据（末位带补 0），无法区分原始末尾的 0 与填充。
+- `entries_from_cache` 从 256 开始顺序扫描，允许段间 0 填充；但遇到损坏的非零
+  段标记会返回 `.InternalError`，不保证从任意垃圾数据中恢复。
+- family 1/2 为性能使用普通 `Solver`（不做最小化），最小 `Σ|param|` 只在
+  family 3 的 `Optimize` 路径保证。
 
 ## 仓库约定
 

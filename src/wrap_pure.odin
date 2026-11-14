@@ -55,7 +55,7 @@ pure_solve :: proc(e: ^Encoder) -> (ok: bool, modes: [CHAR_COUNT]u32, params: [C
 	b := make([]u32, n)
 	x := make([]u32, m)
 	parity := make([]u64, n)
-	rows := make([]u64, n)
+	rows := make([]u128, n)
 	c := make([]u8, n)
 	y := make([]u32, m)
 	defer {
@@ -212,7 +212,7 @@ solve_mod_2_32 :: proc(
 	b: []u32,
 	parity: []u64,
 	x: []u32,
-	rows: []u64,
+	rows: []u128,
 	c: []u8,
 	y: []u32,
 	n, m: int,
@@ -260,7 +260,7 @@ lift_solution :: proc(
 	b: []u32,
 	parity: []u64,
 	x: []u32,
-	rows: []u64,
+	rows: []u128,
 	c: []u8,
 	y: []u32,
 	n, m: int,
@@ -305,22 +305,22 @@ solve_gf2 :: proc(
 	parity: []u64,
 	c: []u8,
 	sol: []u32,
-	rows: []u64,
+	rows: []u128,
 	n, m: int,
 	free_cols: []int,
 	free_count: ^int,
 ) -> bool {
-	AUG_BIT :: 63
+	AUG_BIT :: 127
 	assert(m <= AUG_BIT)
 
 	for i in 0 ..< n {
-		rows[i] = parity[i]
+		rows[i] = u128(parity[i])
 		if c[i] != 0 {
-			rows[i] |= u64(1) << u64(AUG_BIT)
+			rows[i] |= u128(1) << u128(AUG_BIT)
 		}
 	}
 
-	coeff_mask := (u64(1) << u32(m)) - 1
+	coeff_mask := (u128(1) << u32(m)) - 1
 	pivot_row: [64]int
 	for i in 0 ..< 64 {
 		pivot_row[i] = -1
@@ -330,7 +330,7 @@ solve_gf2 :: proc(
 	for col in 0 ..< m {
 		sel := -1
 		for r in row ..< n {
-			if rows[r] & (u64(1) << u32(col)) != 0 {
+			if rows[r] & (u128(1) << u32(col)) != 0 {
 				sel = r
 				break
 			}
@@ -342,7 +342,7 @@ solve_gf2 :: proc(
 			rows[row], rows[sel] = rows[sel], rows[row]
 		}
 		for r in 0 ..< n {
-			if r != row && rows[r] & (u64(1) << u32(col)) != 0 {
+			if r != row && rows[r] & (u128(1) << u32(col)) != 0 {
 				rows[r] ~= rows[row]
 			}
 		}
@@ -354,7 +354,7 @@ solve_gf2 :: proc(
 	}
 
 	for r in 0 ..< n {
-		if rows[r] & coeff_mask == 0 && rows[r] & (u64(1) << u64(AUG_BIT)) != 0 {
+		if rows[r] & coeff_mask == 0 && rows[r] & (u128(1) << u128(AUG_BIT)) != 0 {
 			return false
 		}
 	}
@@ -366,7 +366,7 @@ solve_gf2 :: proc(
 	for col in 0 ..< m {
 		pr := pivot_row[col]
 		if pr >= 0 {
-			sol[col] = u32((rows[pr] >> u64(AUG_BIT)) & 1)
+			sol[col] = u32((rows[pr] >> u128(AUG_BIT)) & 1)
 		} else {
 			free_cols[free_count^] = col
 			free_count^ += 1
@@ -374,6 +374,7 @@ solve_gf2 :: proc(
 	}
 	return true
 }
+
 
 
 
