@@ -8,11 +8,14 @@
 
 - 64 字符（`.`、`A`..`Z`、`_`、`a`..`z`）的 `u32` 操作编码与精确求解
 - 4 档 family：纯 ADD → ADD/SUB → +XOR → +MOD；逐档尝试并共享总超时
-- `add` / `add_framed` 两种样本写入格式，自动维护 `Entry{key, head}`
+- `add` / `add_u32` / `add_framed` 三种样本写入方式；`add_u32` 直接接收
+  `[]u32`，省掉逐字节打包，大载荷更快
 - `verify` 纯 Odin 重放校验；`read_data` / `read_data_exact` 可把字符串解码回数据
   （后者返回原始字节数与去掉填充的 `[]u8`）
 - 可从完整 cache 恢复 `Entry` 与 `Encoder`（`entries_from_cache` /
   `encoder_from_cache`），便于服务端持久化
+- `wrap` 成功后自动清理 samples 与重复检查索引，只保留 cache + 长度表，进入
+  只读服务模式
 - 可作为第三方 Odin 库导入，见 [docs/LIBRARY.md](docs/LIBRARY.md)
 - Z3 运行时动态加载；缺少 Z3 时 family 0 仍可工作，其余返回 `.MissingZ3`
 - `test.csv` 端到端测试与计时，附 Python 生成器
@@ -63,7 +66,7 @@ head, err := oomap.add(&e, "A", []u8{0xDE, 0xAD})
 ```
 OOMap/
 ├── src/oomap/              库包（package oomap）
-│   ├── encoder.odin        Entry / Encoder / add / add_framed / cache 布局 / 恢复
+│   ├── encoder.odin        Entry / Encoder / add / add_u32 / add_framed / cache 布局 / 恢复
 │   ├── eval.odin           Σ、char_index、eval、verify、read_data / read_data_exact
 │   ├── wrap.odin           wrap 主流程、family 调度、Z3 建模
 │   ├── wrap_pure.odin      family 0：纯 Odin 线性求解
@@ -119,15 +122,20 @@ X0         :: 31
 `add` 从 `len(cache)` 起追加段：`0x00000000`、`key_len`、打包 key、`0xFFFF`、
 data 字数、打包 data、`0xFFFF`，并返回段起点 `head`。
 
-## add 与 add_framed
+## add / add_u32 与 add_framed
 
-两个函数共用同一套校验（`frozen` / 空 key / Σ 外字符 / 重复 key）和
-`Entry{key, head}` 语义，区别只在 cache 中的段格式：
+三个函数共用同一套校验（`frozen` / 空 key / Σ 外字符 / 重复 key）和
+`Entry{key, head}` 语义，区别只在数据入参与 cache 段格式：
 
-| 函数 | 段格式 |
-|------|--------|
-| `add(e, key, data)` | 原始任务规格 第 6 节的 `0x0000` / `0xFFFF` 格式 |
-| `add_framed(e, key, data)` | 下方 `0xFF00FFxx` 帧格式 |
+| 函数 | 数据参数 | 段格式 |
+|------|----------|--------|
+| `add(e, key, data)` | `[]u8` | 原始任务规格 第 6 节的 `0x0000` / `0xFFFF` 格式 |
+| `add_u32(e, key, data)` | `[]u32` | 与 `add` 相同的格式，直接写入字，省掉逐字节打包 |
+| `add_framed(e, key, data)` | `[]u8` | 下方 `0xFF00FFxx` 帧格式 |
+
+`add_u32` 适合调用方本来就以 u32 字持有数据的场景；原始字节数为
+`4 * len(data)`。重复 key 检查由 `Encoder` 内的 `map[string]u32` 完成，
+正常批量写入为期望 O(1)。
 
 `add_framed` 追加的内容（`head` 为段起点，字符串与数据均按小端、每 4 字节
 占一个 u32，末位补 0）：
@@ -237,6 +245,12 @@ solution_snapshot :: proc(e: ^Encoder) -> []u32
 不修改 cache。超时不是硬实时：Z3 `Optimize` 可能超出预算，见
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
+成功后 `wrap` 会删除重复检查索引，并在每个 entry 都能从 cache 恢复时释放
+`entries`（样本 key），只保留 cache 和精确长度表，进入只读服务模式；之后
+`read_data*`、`data_length`、`solution_snapshot` 正常，`verify` 按需从 cache
+重建样本，`add*` 返回 `.Frozen`。手工构造、没有数据段的 samples 会保留下来供
+`verify` 使用。
+
 ## Z3 的获取与加载
 
 `lib/` 中已放好 **Z3 5.3.3 x64** 官方 C SDK（`libz3.dll` + `libz3.lib` +
@@ -254,7 +268,8 @@ family 0 继续工作，family 1..3 返回 `.MissingZ3` 并提示“安装 Z3 �
 ## 测试与验收
 
 ```powershell
-# 单元测试（格式、回读、精确长度、快照、cache 恢复、不可行、边界、回绕、frozen）
+# 单元测试（格式、回读、精确长度、add_u32、wrap 后清理、索引、快照、cache 恢复、
+# 不可行、边界、回绕、frozen）
 odin test src/oomap
 
 # 往返 / 性能（family 0）
@@ -296,7 +311,7 @@ python scripts\gen_test_csv.py bin\test.csv 500
 
 ```text
 CSV: file = ...\bin\test.csv
-CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
+CSV: rows=200 passed=200 failed=0 elapsed=772.5ms avg=3.86ms
 ```
 
 每行的 head 由一组隐藏参数决定，程序先把 cache 填充到该位置再 `add`，因此
@@ -317,6 +332,9 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 | 10 多解最小 \|p\| | `--check-z3`（MOD 最小解 p=4） |
 | 附加：数据回读 | `odin test`：`test_read_data`（两种段格式 + 错误字符串） |
 | 附加：精确字节回读 | `odin test`：`test_read_data_exact`（含尾随 0、0 长度、无长度元数据） |
+| 附加：`add_u32` 快速路径 | `odin test`：`test_add_u32`（与 `add` 逐字比较 cache） |
+| 附加：wrap 后只读模式 | `odin test`：`test_compact_after_wrap`（清理 entries/index、verify 重建） |
+| 附加：重复 key 索引 | `odin test`：`test_duplicate_index`（map 命中 + 手工 entry 回退） |
 | 附加：从 cache 还原 Entry | `odin test`：`test_entries_from_cache` |
 | 附加：从 cache 还原 Encoder | `odin test`：`test_encoder_from_cache`（frozen / 长度缺失） |
 | 附加：固定数组快照 | `odin test`：`test_solution_snapshot` |
@@ -361,6 +379,8 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 - 两种段格式都只记录 `u32` 字数，不记录原始字节数。`read_data_exact` 的精确
   长度依赖 Encoder 的内存表；从 cache 恢复后必须用 `read_data_exact_len`，或
   由调用方自己保存长度。`read_data` 仍返回 4 字节对齐的数据（末位补 0）。
+- `wrap` 成功后 `entries` 与 `index` 会被清空；需要保留样本请在 wrap 前自行复制。
+  `verify` 在清理后是按需从 cache 重建，比 wrap 前多一次解析开销。
 - `entries_from_cache` 从 256 开始顺序扫描，允许段间 0 填充；但遇到损坏的非零
   段标记会返回 `.InternalError`，不保证从任意垃圾数据中恢复。
 - family 1/2 为性能使用普通 `Solver`（不做最小化），最小 `Σ|param|` 只在

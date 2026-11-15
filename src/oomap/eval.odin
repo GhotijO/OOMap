@@ -88,6 +88,23 @@ VerifyBad :: struct {
 返回首个不匹配的样本；全部通过时 bad 为 nil。
 */
 verify :: proc(e: ^Encoder) -> (ok: bool, bad: Maybe(VerifyBad)) {
+	// wrap 成功后会清理 entries（只读服务模式）；此时按需从 cache 重建，
+	// 成功后立即释放，避免长期占用样本内存。
+	if e.frozen && len(e.entries) == 0 {
+		entries, err := entries_from_cache(e.cache[:])
+		if err != .None {
+			return false, VerifyBad{"<cache>", 0, 0}
+		}
+		ok, bad = verify_entries(e.cache[:], entries[:])
+		if ok {
+			free_entry_list(&entries)
+		} else {
+			// 保留 entries，使 bad.key 在调用方读取期间仍然有效；
+			// encoder_destroy 会统一释放。
+			e.entries = entries
+		}
+		return ok, bad
+	}
 	return verify_with(e, e.cache[:])
 }
 
@@ -96,11 +113,16 @@ verify :: proc(e: ^Encoder) -> (ok: bool, bad: Maybe(VerifyBad)) {
 */
 @(private)
 verify_with :: proc(e: ^Encoder, cache: []u32) -> (ok: bool, bad: Maybe(VerifyBad)) {
+	return verify_entries(cache, e.entries[:])
+}
+
+@(private)
+verify_entries :: proc(cache: []u32, entries: []Entry) -> (ok: bool, bad: Maybe(VerifyBad)) {
 	if len(cache) < MODE_PARAM_END {
 		return false, VerifyBad{"<cache>", MODE_PARAM_END, u32(len(cache))}
 	}
 
-	for entry in e.entries {
+	for entry in entries {
 		got, valid := eval(cache, entry.key)
 		if !valid {
 			return false, VerifyBad{entry.key, entry.head, got}

@@ -26,6 +26,9 @@ Entry :: struct {
 Encoder :: struct {
 	cache:   [dynamic]u32, // 初始长度 256，全 0
 	entries: [dynamic]Entry,
+	// key -> head，仅用于 add / add_framed / add_u32 的 O(1) 重复检查。
+	// wrap 成功后会被清空（之后进入只读服务模式）。
+	index: map[string]u32,
 	// add / add_framed 写入的原始字节数，键是段起点 head。
 	// 两种段格式本身只记录 u32 字数，原始长度只存在于这个内存表中；
 	// 从 cache 重新构造 Encoder 时无法恢复，见 read_data_exact。
@@ -59,6 +62,7 @@ encoder_init :: proc() -> Encoder {
 		e.cache[i] = 0
 	}
 	e.entries = make([dynamic]Entry)
+	e.index = make(map[string]u32)
 	e.data_lens = make(map[u32]int)
 	return e
 }
@@ -67,6 +71,7 @@ encoder_init :: proc() -> Encoder {
 释放编码器持有的内存（包括 add 时克隆的 key）。
 */
 encoder_destroy :: proc(e: ^Encoder) {
+	delete(e.index)
 	for entry in e.entries {
 		delete(entry.key)
 	}
@@ -131,7 +136,49 @@ add :: proc(e: ^Encoder, key: string, data: []u8) -> (head: u32, err: ErrorCode)
 
 	key_copy, _ := strings.clone(key)
 	append(&e.entries, Entry{key = key_copy, head = head})
+	e.index[key_copy] = head
 	e.data_lens[head] = len(data)
+	return head, .None
+}
+
+/*
+add 的 []u32 快速路径。
+
+data 已经是按小端打包好的 u32 字，直接整段 append 到 cache，省掉 add 的逐字节
+打包循环；段格式与 add 完全相同（0x0000 / 0xFFFF）。原始字节数固定为
+4 * len(data)，没有填充。适合调用方本来就以字为单位持有数据的场景。
+*/
+add_u32 :: proc(e: ^Encoder, key: string, data: []u32) -> (head: u32, err: ErrorCode) {
+	if err2 := check_addable(e, key); err2 != .None {
+		return 0, err2
+	}
+
+	head = u32(len(e.cache))
+
+	append(&e.cache, 0)
+	append(&e.cache, u32(len(key)))
+
+	key_words := (len(key) + 3) / 4
+	for w in 0 ..< key_words {
+		word: u32 = 0
+		for b in 0 ..< 4 {
+			pos := w * 4 + b
+			if pos < len(key) {
+				word |= u32(key[pos]) << u32(b * 8)
+			}
+		}
+		append(&e.cache, word)
+	}
+
+	append(&e.cache, SEGMENT_SEPARATOR)
+	append(&e.cache, u32(len(data)))
+	append(&e.cache, ..data)
+	append(&e.cache, SEGMENT_SEPARATOR)
+
+	key_copy, _ := strings.clone(key)
+	append(&e.entries, Entry{key = key_copy, head = head})
+	e.index[key_copy] = head
+	e.data_lens[head] = len(data) * 4
 	return head, .None
 }
 
@@ -195,6 +242,7 @@ add_framed :: proc(e: ^Encoder, key: string, data: []u8) -> (head: u32, err: Err
 
 	key_copy, _ := strings.clone(key)
 	append(&e.entries, Entry{key = key_copy, head = head})
+	e.index[key_copy] = head
 	e.data_lens[head] = len(data)
 	return head, .None
 }
@@ -215,9 +263,16 @@ check_addable :: proc(e: ^Encoder, key: string) -> ErrorCode {
 			return .InvalidCharacter
 		}
 	}
-	for entry in e.entries {
-		if entry.key == key {
-			return .DuplicateKey
+	// 正常路径（全部 entry 由 add/add_framed/add_u32 写入）走 O(1) 查表。
+	if _, exists := e.index[key]; exists {
+		return .DuplicateKey
+	}
+	// 兼容手工 append(&e.entries, ...) 的高级用法：index 不完整时回退线性扫描。
+	if len(e.index) != len(e.entries) {
+		for entry in e.entries {
+			if entry.key == key {
+				return .DuplicateKey
+			}
 		}
 	}
 	return .None
@@ -248,8 +303,41 @@ encoder_from_cache :: proc(cache: []u32) -> (e: Encoder, err: ErrorCode) {
 	e.cache = make([dynamic]u32, len(cache))
 	copy(e.cache[:], cache)
 	e.entries = entries
+	for entry in entries {
+		e.index[entry.key] = entry.head
+	}
 	e.frozen = true
 	return e, .None
+}
+
+/*
+wrap 成功后清理求解期状态，进入只读服务模式。
+
+只有当每个 entry 都能在 cache 中找到对应数据段时，才释放 entries；
+手工构造、没有数据段的样本无法从 cache 恢复，保留它们供 verify 使用。
+无论哪种情况都会删除重复检查索引（frozen 后不再需要 add）。
+*/
+@(private)
+compact_after_wrap :: proc(e: ^Encoder) {
+	delete(e.index)
+	e.index = nil
+	if entries_recoverable(e) {
+		free_entry_list(&e.entries)
+	}
+}
+
+@(private)
+entries_recoverable :: proc(e: ^Encoder) -> bool {
+	if len(e.cache) <= RESERVED_LEN {
+		return false
+	}
+	for entry in e.entries {
+		_, _, ok := locate_segment(e.cache[:], entry.key, int(entry.head))
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 /*

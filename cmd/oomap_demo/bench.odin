@@ -221,6 +221,7 @@ bench_z3 :: proc() {
 	// 最小 family 3 场景：A / AA 共享 head=3，ADD 下 2p 与 p 矛盾，必须用 MOD。
 	e := make_minimal_encoder()
 	defer encoder_destroy(&e)
+	n := len(e.entries)
 
 	info: WrapInfo
 	start := time.tick_now()
@@ -232,7 +233,7 @@ bench_z3 :: proc() {
 	}
 	fmt.printf(
 		"BENCH z3: n=%d %.2fms family=%d verify=%v err=%v\n",
-		len(e.entries), elapsed, info.solved_family, verify_ok, err,
+		n, elapsed, info.solved_family, verify_ok, err,
 	)
 	wrap_info_destroy(&info)
 }
@@ -261,11 +262,88 @@ bench_z3_stress :: proc() {
 	wrap_info_destroy(&info)
 }
 
+/*
+add 的 []u32 快速路径：与 add 对比，分别覆盖小载荷和大载荷。
+*/
+@(private)
+bench_add_u32 :: proc() {
+	// 小载荷（2 words = 8 字节）：主要比较固定开销。
+	{
+		N :: 5000
+		keys := bench_unique_keys(N, 0x4000)
+		defer bench_free_keys(&keys)
+
+		bytes_data := []u8{1, 2, 3, 4, 5, 6, 7, 8}
+		words_data := []u32{0x04030201, 0x08070605}
+
+		e_bytes := encoder_init()
+		start := time.tick_now()
+		for key in keys {
+			add(&e_bytes, key, bytes_data)
+		}
+		bytes_ms := bench_ms(start)
+		encoder_destroy(&e_bytes)
+
+		e_words := encoder_init()
+		start = time.tick_now()
+		for key in keys {
+			add_u32(&e_words, key, words_data)
+		}
+		words_ms := bench_ms(start)
+		encoder_destroy(&e_words)
+
+		fmt.printf(
+			"BENCH add vs add_u32: n=%d bytes=8  add=%.2fms add_u32=%.2fms speedup=%.2fx\n",
+			N, bytes_ms, words_ms, bytes_ms / words_ms,
+		)
+	}
+
+	// 大载荷（1024 words = 4 KiB）：逐字节打包的差距更明显。
+	{
+		N :: 1000
+		keys := bench_unique_keys(N, 0x5000)
+		defer bench_free_keys(&keys)
+
+		bytes_data := make([]u8, 4096)
+		defer delete(bytes_data)
+		for i in 0 ..< len(bytes_data) {
+			bytes_data[i] = u8(i & 0xFF)
+		}
+		words_data := make([]u32, 1024)
+		defer delete(words_data)
+		for i in 0 ..< len(words_data) {
+			words_data[i] = u32(i * 0x0101_0101)
+		}
+
+		e_bytes := encoder_init()
+		start := time.tick_now()
+		for key in keys {
+			add(&e_bytes, key, bytes_data)
+		}
+		bytes_ms := bench_ms(start)
+		encoder_destroy(&e_bytes)
+
+		e_words := encoder_init()
+		start = time.tick_now()
+		for key in keys {
+			add_u32(&e_words, key, words_data)
+		}
+		words_ms := bench_ms(start)
+		encoder_destroy(&e_words)
+
+		fmt.printf(
+			"BENCH add vs add_u32: n=%d bytes=4096 add=%.2fms add_u32=%.2fms speedup=%.2fx\n",
+			N, bytes_ms, words_ms, bytes_ms / words_ms,
+		)
+	}
+}
+
 @(private)
 bench :: proc() {
 	fmt.println("== benchmark ==")
 	fmt.println("注意：计时只包含被测函数；add 的 key 生成在计时之外。")
 	bench_add()
+	bench_add_u32()
 	bench_wrap()
 	bench_read()
 	bench_entries()

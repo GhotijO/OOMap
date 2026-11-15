@@ -92,15 +92,22 @@ main :: proc() {
 
 | API | 说明 |
 |-----|------|
-| `add(e, key, data) -> (head u32, ErrorCode)` | 旧格式段；返回段起点 head |
-| `add_framed(e, key, data) -> (head u32, ErrorCode)` | `0xFF00FFxx` 帧格式；语义与 add 相同 |
+| `add(e, key, data []u8) -> (head u32, ErrorCode)` | 旧格式段；返回段起点 head |
+| `add_u32(e, key, data []u32) -> (head u32, ErrorCode)` | 旧格式段的快速路径：`data` 已是小端 u32 字，直接整段写入 |
+| `add_framed(e, key, data []u8) -> (head u32, ErrorCode)` | `0xFF00FFxx` 帧格式；语义与 add 相同 |
 
-两者都会：校验 frozen / 空 key / Σ 外字符 / 重复 key；把 key 克隆进
+三者都会：校验 frozen / 空 key / Σ 外字符 / 重复 key；把 key 克隆进
 `e.entries`；把原始数据长度记录到内存表。失败时**不修改任何状态**。
+重复 key 检查由 `Encoder` 内的 `map[string]u32` 完成，正常批量写入是期望 O(1)。
+
+`add_u32` 的段格式与 `add` 完全一致，只是省掉逐字节打包循环；原始字节数固定为
+`4 * len(data)`，没有填充。数据较小（例如 1~2 个 word）时固定开销仍占主导，
+优势主要在大载荷；实测 4 KiB 载荷约快 8 倍（见
+[PERFORMANCE.md](PERFORMANCE.md)）。
 
 `head` 由 `len(cache)` 决定，所以调用方不能指定 head。若需要固定 head，可先用
 `cache_view` 读出 cache 长度并追加 0 填充，但这是高级用法，且必须保证后续
-`add` 的段起点与目标 head 一致。
+`add` / `add_u32` / `add_framed` 的段起点与目标 head 一致。
 
 ### 3.3 求解与校验
 
@@ -111,6 +118,17 @@ main :: proc() {
 | `wrap_info_destroy(*WrapInfo)` | 释放 `message` |
 | `verify(e) -> (bool, Maybe(VerifyBad))` | 纯 Odin 重放；不调用 Z3 |
 | `eval(cache []u32, key) -> (u32, bool)` | 只按 mode/param 求值，不读数据段 |
+
+**wrap 成功后的只读模式**：`wrap_ex` 在提交解之后会删除重复检查索引；如果每个
+entry 都能在 cache 中找到对应数据段，则释放 `entries`（样本 key），只保留 cache
+与长度表，便于长期服务外部读取。此时：
+
+- `read_data` / `read_data_exact` / `data_length` / `solution_snapshot` 正常；
+- `verify` 会按需从 cache 重建 entries，成功后立即释放；失败时保留它们，以便
+  `bad.key` 在调用方读取期间有效；
+- `add` / `add_framed` / `add_u32` 返回 `.Frozen`。
+
+如果需要保留 samples 做别的事情，请在调用 `wrap` 之前自行复制 `entries`。
 
 `WrapInfo` 字段：`solved_family`（-1 表示失败）、`families_tried`、`missing_z3`、
 `timed_out`、`message`。`message` 由 `wrap_info_destroy` 释放，不要自己 `delete`。
@@ -141,7 +159,8 @@ main :: proc() {
 返回的 `[]u8` 都由调用方 `delete`（长度为 0 时也可安全 `delete`）。
 
 `n = 0`、末尾恰好是 `0x00` 的数据都能正确区分：`read_data_exact` 只按记录的
-长度截断，不会把原始尾随 0 当成填充。
+长度截断，不会把原始尾随 0 当成填充。`add_u32` 写入的段，其 `n` 为
+`4 * len(data)`。
 
 ### 3.5 持久化
 
@@ -205,7 +224,9 @@ Encoder 的内存表里。`encoder_from_cache` 恢复出的编码器：
 
 4. `wrap_info_destroy` 之后 `WrapInfo.message` 失效；不要复制 `WrapInfo` 后重复
    destroy。
-5. `cache_view` 返回的切片在 `add` / `add_framed` 导致 cache 扩容后失效。
+5. `cache_view` 返回的切片在 `add` / `add_u32` / `add_framed` 导致 cache 扩容后失效。
+6. `wrap` 成功会删除 `index`，并在 entries 可恢复时释放 `entries`；不要继续持有
+   旧的 `Entry.key` 指针。
 
 ## 5. 线程安全
 
@@ -231,7 +252,7 @@ Encoder 的内存表里。`encoder_from_cache` 恢复出的编码器：
 | `verify_with` | 对任意工作缓冲区重放；会绕过“只有提交后才改 cache”的约定 |
 | `locate_segment*` / `read_segment_exact` / `packed_key_matches` / `unpack_words` | 段定位/解包内部实现，越界检查与 key 校验耦合 |
 | `pure_solve` / `solve_full_rank` / `solve_mod_2_32` / `lift_solution` / `solve_gf2` / `solve_kernel_lift` / `gf2_solve_k` / `inv_odd` | family 0 求解器内部步骤，不保证输入/输出契约 |
-| `elapsed_ms` / `tried_families_string` / `commit_solution` / `z3_solve_family` / `z3_model_uint64` / `z3_release` | wrap 调度与 Z3 资源释放内部实现 |
+| `elapsed_ms` / `tried_families_string` / `commit_solution` / `compact_after_wrap` / `entries_recoverable` / `z3_solve_family` / `z3_model_uint64` / `z3_release` | wrap 调度、清理与 Z3 资源释放内部实现 |
 | `z3_reset` / `z3_try_load` / `z3_api_complete` | 进程级 Z3 全局状态；`z3_reset` 会让正在进行的求解失效 |
 
 ### 6.2 公开但“不要碰”的状态
@@ -242,6 +263,7 @@ Odin 的字段没有 `@(private)`，下面这些字段从包外**语法上可见
 |------|------|
 | `Encoder.cache` | 直接 append/改元素会破坏 head、段边界、frozen 语义；扩容会让 `cache_view` 失效 |
 | `Encoder.entries` | 直接 append 不会克隆 key、不会去重、不会更新精确长度表 |
+| `Encoder.index` | 重复检查索引；手工修改会破坏 O(1) 检查，wrap 后会被清空 |
 | `Encoder.data_lens` | 长度表必须与段内容一致，否则 `read_data_exact` 会误判 |
 | `Encoder.frozen` | 绕过 frozen 会让已提交的 wrap 结果失效 |
 | `WrapInfo.*` | `message` 由 destroy 释放；复制结构体会双重释放 |
@@ -277,8 +299,12 @@ Windows 依次尝试 `libz3.dll`、`lib\libz3.dll`、exe 同目录、exe 同目�
 - 目前只在 Windows x64 + Odin `dev-2026-10-nightly` + Z3 5.3.3 上实测。
 - `wrap` 的总超时不是硬实时：family 0 是同步求解，Z3 Optimize 可能在
   `timeout_ms` 之后才返回（见 [PERFORMANCE.md](PERFORMANCE.md) 的实测）。
-- 重复 key：`add`/`add_framed` 拒绝；`wrap` 对“同 key 不同 head”返回
-  `.Infeasible`，对“同 key 同 head”返回 `.DuplicateKey`。
+- 重复 key：`add` / `add_u32` / `add_framed` 拒绝；`wrap` 对“同 key 不同 head”
+  返回 `.Infeasible`，对“同 key 同 head”返回 `.DuplicateKey`。
+- `wrap` 成功后 `index` 会被清空；可恢复的 `entries` 也会被释放。`verify` 之后的
+  调用是“按需重建”，比 wrap 之前多一次 cache 解析开销，但不会长期占用样本内存。
+  手工构造、没有数据段的 samples 无法从 cache 恢复，会保留 `entries` 供 verify
+  使用。
 - `read_data_exact` 依赖内存中的长度表；从 cache 恢复后必须用
   `read_data_exact_len` 或另存长度。
 - `entries_from_cache` 从下标 256 开始顺序扫描，允许段间 0 填充；损坏的非零

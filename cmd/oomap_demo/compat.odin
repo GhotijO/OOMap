@@ -21,6 +21,7 @@ RESERVED_LEN :: oomap.RESERVED_LEN
 encoder_init :: oomap.encoder_init
 encoder_destroy :: oomap.encoder_destroy
 add :: oomap.add
+add_u32 :: oomap.add_u32
 add_framed :: oomap.add_framed
 wrap_ex :: oomap.wrap_ex
 wrap_info_destroy :: oomap.wrap_info_destroy

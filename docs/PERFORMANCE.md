@@ -33,16 +33,18 @@ bin\OOMap.exe --test-csv
 ### 2.1 `--bench`（代表性一次）
 
 ```text
-BENCH add: n=1000 2.88ms (2.879 us/entry) cache=9389 words
-BENCH add: n=5000 77.02ms (15.404 us/entry) cache=46028 words
-BENCH add: n=10000 266.10ms (26.610 us/entry) cache=91640 words
-BENCH wrap: n=100 0.51ms (5.149 us/entry) family=0 verify=0.009ms ok=true
-BENCH wrap: n=1000 1.73ms (1.732 us/entry) family=0 verify=0.116ms ok=true
-BENCH wrap: n=5000 6.47ms (1.294 us/entry) family=0 verify=0.607ms ok=true
-BENCH read: iters=100000 read_data=155.5ns/op read_data_exact=168.8ns/op
-BENCH entries_from_cache: n=1000 parsed=1000 0.24ms (0.240 us/entry) err=None
-BENCH entries_from_cache: n=5000 parsed=5000 1.59ms (0.318 us/entry) err=None
-BENCH z3: n=2 725.61ms family=3 verify=true err=None
+BENCH add: n=1000 1.01ms (1.014 us/entry) cache=9389 words
+BENCH add: n=5000 3.80ms (0.760 us/entry) cache=46028 words
+BENCH add: n=10000 6.57ms (0.657 us/entry) cache=91640 words
+BENCH add vs add_u32: n=5000 bytes=8  add=3.81ms add_u32=3.42ms speedup=1.11x
+BENCH add vs add_u32: n=1000 bytes=4096 add=21.80ms add_u32=2.57ms speedup=8.47x
+BENCH wrap: n=100 0.52ms (5.150 us/entry) family=0 verify=0.009ms ok=true
+BENCH wrap: n=1000 1.84ms (1.836 us/entry) family=0 verify=0.104ms ok=true
+BENCH wrap: n=5000 6.51ms (1.303 us/entry) family=0 verify=0.560ms ok=true
+BENCH read: iters=100000 read_data=165.2ns/op read_data_exact=156.7ns/op
+BENCH entries_from_cache: n=1000 parsed=1000 0.24ms (0.244 us/entry) err=None
+BENCH entries_from_cache: n=5000 parsed=5000 1.31ms (0.262 us/entry) err=None
+BENCH z3: n=2 592.21ms family=3 verify=true err=None
 ```
 
 ### 2.2 `--bench-z3-stress`
@@ -57,7 +59,7 @@ BENCH z3-stress: n=128 57897.31ms (timeout_ms=10000) family=3 err=None
 ### 2.3 CSV 端到端
 
 ```text
-CSV: rows=200 passed=200 failed=0 elapsed=803.5ms avg=4.02ms
+CSV: rows=200 passed=200 failed=0 elapsed=772.5ms avg=3.86ms
 ```
 
 每行都执行 `add -> wrap -> verify -> read_data_exact -> 字节比对`；其中 wrap
@@ -65,22 +67,24 @@ CSV: rows=200 passed=200 failed=0 elapsed=803.5ms avg=4.02ms
 
 ## 3. 逐项分析
 
-### 3.1 `add` / `add_framed`：O(n²) 的重复 key 检查
+### 3.1 `add` / `add_u32` / `add_framed`
 
-代码路径：`check_addable` 先遍历 `e.entries` 做线性查找，再 append 段。
+`check_addable` 现在先查 `Encoder.index`（`map[string]u32`，key → head），正常
+批量写入的重复 key 检查是期望 O(1)：
 
-- 每次 `add` 的重复检查是 `O(n)`，累计 `O(n²)`；
-- 实测每条约 2.9 µs（n=1k）→ 15.4 µs（n=5k）→ 26.6 µs（n=10k），
-  10k 条总计约 266 ms；
-- key 克隆、cache 追加、长度表写入是次要成本。
+- 实测每条约 0.6–1.0 µs；10k 条总计约 **6.6 ms**，已不再是批量导入瓶颈；
+- 只有“手工 append `entries` 但没更新 index”的高级用法才会走
+  `len(index) != len(entries)` 的线性回退，保证重复检测仍然正确；
+- key 克隆、cache 追加、长度表写入是剩余的主要成本。
 
-这是**批量导入的头号瓶颈**。如果改为 `map[string]u32`（key → head）维护已用
-key，可把重复检查降到期望 `O(1)`，但需要处理“手工构造 entries 后 map 为空”的
-兼容问题，并增加每条 entry 的哈希表内存。当前实现优先保证 `add` 与手工
-`entries` 两条路径行为一致，因此保留了线性扫描。
+`add_u32` 是 `add` 的快速路径：调用方直接给出小端 u32 字，函数用
+`append(&cache, ..data)` 整段写入，省掉 `add` 的逐字节打包循环。
 
-`add_framed` 的段比 `add` 多 3 个 marker（`START/KEY/DATA/DATA_LEN/END`），
-cache 占用略高，但校验和追加成本同阶，重复 key 检查同样是 O(n²)。
+- 小载荷（2 words）：约 1.1x，固定开销（key 克隆、marker、map 写入）占主导；
+- 4 KiB 载荷（1024 words）：`add` 约 21.8 ms，`add_u32` 约 2.6 ms，**约 8.5x**。
+
+`add_framed` 的段比 `add` 多 3 个 marker（`START/KEY/DATA_LEN/DATA/END`），
+cache 占用略高，但校验和追加成本同阶；重复 key 检查同样命中 map。
 
 ### 3.2 `wrap` family 0：n×64 的计数矩阵与逐位提升
 
@@ -94,23 +98,35 @@ cache 占用略高，但校验和追加成本同阶，重复 key 检查同样是
    `O(32·(n·m + m³))`。
 4. 最后 `commit_solution` 的 `verify_with` 全量重放。
 
-实测 n=5000 时 6.47 ms（约 1.3 µs/entry），verify 另占 0.6 ms；n=100 时固定
-开销占主导（5.1 µs/entry）。在 64 个未知数的规模下，这是可接受的主路径。
+实测 n=5000 时约 6.5 ms（约 1.3 µs/entry），verify 另占约 0.6 ms；n=100 时固定
+开销占主导（5.2 µs/entry）。在 64 个未知数的规模下，这是可接受的主路径。
 
 内存是这一路径的主要压力：`counts`、`parity`、`rows` 等数组都随 n 线性增长；
 若把 `counts` 从 `u64` 收窄为 `u32`（每个 key 的字符计数远小于 2³²），可省一半
 内存。n 继续增大时，优先改成分块/稀疏计数，而不是继续放大稠密矩阵。
 
-### 3.3 `verify` 与 `read_data`
+### 3.3 `verify`、`read_data` 与 wrap 后清理
 
-- `verify` 是纯重放：`O(Σ key_len)`，n=5000 约 0.6 ms，属于廉价操作；
-- `read_data` 对 13 字节数据约 155 ns/op，主要由一次 `make([]u8, 8)` 和段校验
-  组成；`read_data_exact` 约 169 ns/op，多做一次填充区零值扫描和一次精确分配。
-  两者都在百纳秒级，适合在线路径。
+- `verify` 是纯重放：`O(Σ key_len)`，n=5000 约 0.56 ms，属于廉价操作；
+- `read_data` 对 13 字节数据约 150–170 ns/op，主要由一次 `make([]u8, 8)` 和段
+  校验组成；`read_data_exact` 多做一次填充区零值扫描和精确分配，量级相同。
+  两者都适合在线路径。
+
+`wrap` 成功后会尽量清理求解期状态：
+
+- 如果每个 entry 都能在 cache 中找到对应数据段，释放 `entries`（样本 key）并
+  删除重复检查索引，只保留 cache 与精确长度表；
+- 手工构造、没有数据段的 samples 无法从 cache 恢复，会保留 `entries` 供 verify
+  使用；
+- 清理后 `verify` 会按需从 cache 重建 entries，成功后立即释放，失败时保留以便
+  `bad.key` 有效。
+
+因此 add 数据的典型工作流在 wrap 后常驻内存只剩 cache + 长度表；verify 是
+“按需重放”，不会长期占用样本内存。
 
 ### 3.4 Z3 family 3：真正的最坏情况
 
-- 最小场景（2 条样本，A/AA 共享 head=3）需要 family 3，单次约 **726 ms**；
+- 最小场景（2 条样本，A/AA 共享 head=3）需要 family 3，单次约 **592 ms**；
 - 128 条样本、`timeout_ms=10_000` 的 `Optimize` 实测约 **57.9 s** 才返回。
 
 原因：
@@ -132,10 +148,10 @@ family 0 求解器的完备性边界，而不是扩大可解集合。真正扩�
 Z3 建模成本往往是不必要的；可以考虑在 family 0 失败后直接跳到 2/3，或先做
 轻量的可满足性预判。
 
-### 3.5 `entries_from_cache`：每条约 0.24–0.32 µs
+### 3.5 `entries_from_cache`：每条约 0.24–0.27 µs
 
 `unpack_key` 先 `make([]u8, key_len)`，校验后再 `strings.clone_from_bytes`，
-每条 entry **两次分配**；随后 `[dynamic]Entry` 再扩容。n=5000 约 1.6 ms，适合
+每条 entry **两次分配**；随后 `[dynamic]Entry` 再扩容。n=5000 约 1.3 ms，适合
 启动时加载，但可优化为一次分配（直接在最终 string 上校验）或使用 arena。
 
 ### 3.6 其它固定开销
@@ -145,37 +161,40 @@ Z3 建模成本往往是不必要的；可以考虑在 family 0 失败后直接�
 - cache 用逐字 `append` 增长，容量按倍增策略摊销；已知总大小时可
   `reserve` 减少拷贝。
 - Z3 首次加载会尝试多个路径；失败路径会遍历候选并 unload，属于一次性成本。
+- `add_u32` 虽然省掉字节打包，但 key 仍要逐字符打包；key 很长时这部分会成为
+  新的固定开销。
 
 ## 4. 瓶颈排序
 
 | 排名 | 场景 | 量级 | 主要原因 |
 |------|------|------|----------|
-| 1 | family 3 的 Z3 Optimize | 0.7 s ~ 58 s | 多目标优化 + 大 `ite` 表达式 + 超时非硬实时 |
-| 2 | 批量 `add` | 10k 条约 266 ms | 重复 key 线性扫描，O(n²) |
-| 3 | 大 n 的 family 0 内存 | n=10k 约 5 MB 临时数组 | `counts` 为 n×64×8 字节稠密矩阵 |
-| 4 | `entries_from_cache` | 0.3 µs/entry | 每 key 两次分配 |
-| 5 | `read_data*` | 0.15–0.17 µs/次 | 一次分配 + 段校验 |
+| 1 | family 3 的 Z3 Optimize | 0.6 s ~ 58 s | 多目标优化 + 大 `ite` 表达式 + 超时非硬实时 |
+| 2 | 大 n 的 family 0 内存 | n=10k 约 5 MB 临时数组 | `counts` 为 n×64×8 字节稠密矩阵 |
+| 3 | `entries_from_cache` | 0.25 µs/entry | 每 key 两次分配 |
+| 4 | `read_data*` | 0.15–0.17 µs/次 | 一次分配 + 段校验 |
+| 5 | `add_u32` 小载荷 | 约 0.5–0.7 µs/entry | key 克隆/打包与 map 写入 |
+
+重复 key 检查已从 O(n²) 降为期望 O(1)，不再出现在瓶颈列表里。
 
 ## 5. 可选的优化方向（未实现）
 
-1. **重复 key 表**：`Encoder` 内维护 `map[string]u32`，`add` 期望 O(1)；手工
-   entries 路径需要显式重建或保留 fallback。
-2. **cache 预留**：提供 `reserve_cache(e, n)`，批量导入前一次性扩容。
-3. **懒生成 `WrapInfo.message`**：只在调用方请求诊断时格式化；成功路径不再分配。
-4. **收窄计数类型**：`counts` 用 `u32`，内存减半；或按实际字符列压缩。
-5. **`entries_from_cache` 单次分配**：直接在最终 key 字符串上校验字符集。
-6. **Z3 路径治理**：family 0 失败后跳过 family 1（可满足性等价），或把 Z3 放到
+1. **cache 预留**：提供 `reserve_cache(e, n)`，批量导入前一次性扩容。
+2. **懒生成 `WrapInfo.message`**：只在调用方请求诊断时格式化；成功路径不再分配。
+3. **收窄计数类型**：`counts` 用 `u32`，内存减半；或按实际字符列压缩。
+4. **`entries_from_cache` 单次分配**：直接在最终 key 字符串上校验字符集。
+5. **Z3 路径治理**：family 0 失败后跳过 family 1（可满足性等价），或把 Z3 放到
    可终止的子进程；对在线服务设置外部超时。
-7. **硬超时**：目前 `timeout_ms` 只是协作式预算；若要硬保证，需要线程/进程级
+6. **硬超时**：目前 `timeout_ms` 只是协作式预算；若要硬保证，需要线程/进程级
    取消或 Z3 的 `Z3_interrupt`（当前绑定未暴露）。
+7. **`add_u32` 的 key 打包**：key 很长时可先把 key 预打包成 u32 复用。
 
 ## 6. 结论
 
 - family 0 是主路径：n=5000 约 6.5 ms，完全够用；
-- `add` 的 O(n²) 重复检查是批量导入的主要瓶颈，10k 条约 0.27 s；
+- `map[string]u32` 已消除 `add` 的 O(n²) 重复检查：10k 条从约 0.27 s 降到约
+  6.6 ms；
+- `add_u32` 对大载荷有效（4 KiB 约 8.5x），小载荷收益有限；
 - Z3 family 3 是数量级更贵的最坏情况，且 `timeout_ms` 不能硬性截断，**不要把
   它放在延迟敏感的同步请求路径**；
-- 内存占用主要由 family 0 的 n×64 临时矩阵和 cache 本身构成，n=10k 时仍在
-  几 MB 量级；
-- 对当前 64 字符、千级样本的典型用法，性能不是问题；规模再上一个数量级时，
-  优先处理重复 key 表和 Z3 路径。
+- wrap 后的清理让常驻内存聚焦于 cache + 长度表；手工样本因无法从 cache 恢复
+  而保留，verify 仍可用。

@@ -282,6 +282,9 @@ test_all_chars_underdetermined :: proc(t: ^testing.T) {
 	defer wrap_info_destroy(&info)
 	testing.expect_value(t, err, ErrorCode.None)
 	testing.expect_value(t, info.solved_family, 0)
+	// 该样本没有数据段，cache 无法恢复 entry，因此 entries 被保留供 verify 使用。
+	testing.expect_value(t, len(e.entries), 1)
+	testing.expect_value(t, len(e.index), 0)
 	ok, _ := verify(&e)
 	testing.expect(t, ok)
 }
@@ -587,4 +590,129 @@ test_encoder_from_cache :: proc(t: ^testing.T) {
 	// 恢复出来的 Encoder 已 frozen。
 	_, add_err := add(&restored, "C", nil)
 	testing.expect_value(t, add_err, ErrorCode.Frozen)
+}
+
+// ---------------------------------------------------------------- 11. add_u32 快速路径
+
+@(test)
+test_add_u32 :: proc(t: ^testing.T) {
+	// add_u32 的 []u32 应产生与 add 的等价 8 字节载荷完全相同 cache。
+	bytes_data := []u8{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	words_data := []u32{0x04030201, 0x08070605}
+
+	e1 := encoder_init()
+	defer encoder_destroy(&e1)
+	head1, err1 := add(&e1, "AB", bytes_data)
+	testing.expect_value(t, err1, ErrorCode.None)
+
+	e2 := encoder_init()
+	defer encoder_destroy(&e2)
+	head2, err2 := add_u32(&e2, "AB", words_data)
+	testing.expect_value(t, err2, ErrorCode.None)
+
+	testing.expect_value(t, head2, head1)
+	testing.expect_value(t, len(e2.cache), len(e1.cache))
+	for i in 0 ..< len(e1.cache) {
+		testing.expect_value(t, e2.cache[i], e1.cache[i])
+	}
+
+	// 空 []u32 也是合法的 0 字节载荷。
+	_, empty_err := add_u32(&e2, "C", nil)
+	testing.expect_value(t, empty_err, ErrorCode.None)
+
+	// add 只是写入段；需要 wrap 求出能定位到段起点的 mode/param。
+	info: WrapInfo
+	wrap_err := wrap_ex(&e2, 5_000, &info)
+	wrap_info_destroy(&info)
+	testing.expect_value(t, wrap_err, ErrorCode.None)
+
+	got, length, ok := read_data_exact(&e2, "AB")
+	defer delete(got)
+	testing.expect(t, ok)
+	testing.expect_value(t, length, len(bytes_data))
+	testing.expect_value(t, len(got), len(bytes_data))
+	for i in 0 ..< len(bytes_data) {
+		testing.expect_value(t, got[i], bytes_data[i])
+	}
+
+	empty, empty_len, empty_ok := read_data_exact(&e2, "C")
+	defer delete(empty)
+	testing.expect(t, empty_ok)
+	testing.expect_value(t, empty_len, 0)
+	testing.expect_value(t, len(empty), 0)
+}
+
+// ---------------------------------------------------------------- 12. wrap 后清理
+
+@(test)
+test_compact_after_wrap :: proc(t: ^testing.T) {
+	e := encoder_init()
+	defer encoder_destroy(&e)
+
+	for len(e.cache) < 300 {
+		append(&e.cache, 0)
+	}
+	_, e1 := add(&e, "A", []u8{0x10, 0x20, 0x30})
+	testing.expect_value(t, e1, ErrorCode.None)
+	_, e2 := add_u32(&e, "B", []u32{0x44332211})
+	testing.expect_value(t, e2, ErrorCode.None)
+
+	info: WrapInfo
+	wrap_err := wrap_ex(&e, 5_000, &info)
+	wrap_info_destroy(&info)
+	testing.expect_value(t, wrap_err, ErrorCode.None)
+
+	// samples 与重复检查索引已清理，只保留 cache + 长度表。
+	testing.expect_value(t, len(e.entries), 0)
+	testing.expect_value(t, len(e.index), 0)
+
+	// 外部读取仍然可用。
+	got, length, read_ok := read_data_exact(&e, "A")
+	defer delete(got)
+	testing.expect(t, read_ok)
+	testing.expect_value(t, length, 3)
+	testing.expect_value(t, got[2], u8(0x30))
+
+	known, known_ok := data_length(&e, "B")
+	testing.expect_value(t, known_ok, true)
+	testing.expect_value(t, known, 4)
+
+	// verify 按需从 cache 重建 entries，成功后仍保持清理状态。
+	verify_ok, _ := verify(&e)
+	testing.expect(t, verify_ok)
+	testing.expect_value(t, len(e.entries), 0)
+
+	// 仍可从 cache 还原出两条 entry。
+	entries, parse_err := entries_from_cache(e.cache[:])
+	testing.expect_value(t, parse_err, ErrorCode.None)
+	testing.expect_value(t, len(entries), 2)
+	for entry in entries {
+		delete(entry.key)
+	}
+	delete(entries)
+
+	// 只读服务模式禁止继续 add。
+	_, frozen_err := add_u32(&e, "C", nil)
+	testing.expect_value(t, frozen_err, ErrorCode.Frozen)
+}
+
+// ---------------------------------------------------------------- 13. 重复 key 索引
+
+@(test)
+test_duplicate_index :: proc(t: ^testing.T) {
+	e := encoder_init()
+	defer encoder_destroy(&e)
+
+	_, first := add(&e, "A", nil)
+	testing.expect_value(t, first, ErrorCode.None)
+	_, dup := add(&e, "A", nil)
+	testing.expect_value(t, dup, ErrorCode.DuplicateKey)
+	_, dup_u32 := add_u32(&e, "A", nil)
+	testing.expect_value(t, dup_u32, ErrorCode.DuplicateKey)
+
+	// 手工 append 的 entry 不在 index 中：回退线性扫描仍能发现重复。
+	k, _ := strings.clone("X")
+	append(&e.entries, Entry{key = k, head = 100})
+	_, manual_dup := add(&e, "X", nil)
+	testing.expect_value(t, manual_dup, ErrorCode.DuplicateKey)
 }

@@ -65,6 +65,7 @@ wrap_ex :: proc(e: ^Encoder, timeout_ms: u32, info: ^WrapInfo) -> ErrorCode {
 
 	if len(e.entries) == 0 {
 		e.frozen = true
+		compact_after_wrap(e)
 		info.message = fmt.aprintf("wrap: entries 为空，保持保留区为 0 并置 frozen")
 		return .None
 	}
@@ -234,6 +235,7 @@ commit_solution :: proc(e: ^Encoder, modes, params: [CHAR_COUNT]u32, family: int
 		e.cache[i] = work[i]
 	}
 	e.frozen = true
+	compact_after_wrap(e)
 	return true
 }
 
