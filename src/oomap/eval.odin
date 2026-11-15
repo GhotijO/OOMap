@@ -1,4 +1,4 @@
-package main
+package oomap
 
 // 64 字符地址编码器 —— 字符集、求值与校验
 //
@@ -36,6 +36,7 @@ char_index :: proc(ch: rune) -> (idx: u8, ok: bool) {
 
 mode: 0=ADD, 1=SUB, 2=XOR, 3=MOD（p=0 时不取模）
 */
+@(private)
 apply :: proc(mode: u32, p: u32, x: u32) -> u32 {
 	switch mode {
 	case 0:
@@ -93,6 +94,7 @@ verify :: proc(e: ^Encoder) -> (ok: bool, bad: Maybe(VerifyBad)) {
 /*
 使用指定的 cache 切片重放校验（wrap 在提交前对工作缓冲区调用）。
 */
+@(private)
 verify_with :: proc(e: ^Encoder, cache: []u32) -> (ok: bool, bad: Maybe(VerifyBad)) {
 	if len(cache) < MODE_PARAM_END {
 		return false, VerifyBad{"<cache>", MODE_PARAM_END, u32(len(cache))}
@@ -127,89 +129,171 @@ read_data :: proc(e: ^Encoder, key: string) -> (data: []u8, ok: bool) {
 	if !valid {
 		return nil, false
 	}
-	return read_segment_at(e.cache[:], key, int(head))
+	start, words, found := locate_segment(e.cache[:], key, int(head))
+	if !found {
+		return nil, false
+	}
+	return unpack_words(e.cache[:], start, words), true
+}
+
+/*
+读取 key 对应的**原始字节**，同时返回 add / add_framed 时传入的字节数。
+
+与 read_data 的区别：
+  - read_data 返回按 4 字节对齐的数据（末尾补 0），长度是 ceil(n/4)*4；
+  - read_data_exact 去掉填充，len(data) 就是原始长度 n。
+
+原始长度没有写进 cache（两种段格式都只存 u32 字数），而是由 Encoder 在
+add / add_framed 时记录在内存表里。因此：
+  - 同一个 Encoder 上（wrap 前后均可）返回精确长度；
+  - 从 cache 重新构造的 Encoder 没有这张表，ok=false；
+    此时如果调用方自己保存了原始长度，请用 read_data_exact_len。
+*/
+read_data_exact :: proc(e: ^Encoder, key: string) -> (data: []u8, length: int, ok: bool) {
+	head, valid := eval(e.cache[:], key)
+	if !valid {
+		return nil, 0, false
+	}
+	exact, known := e.data_lens[head]
+	if !known {
+		return nil, 0, false
+	}
+	data, ok = read_segment_exact(e.cache[:], key, int(head), exact)
+	if !ok {
+		return nil, 0, false
+	}
+	return data, exact, true
+}
+
+/*
+由调用方给出原始字节数的 read_data_exact。
+
+用于只持有 cache（例如从磁盘恢复）的场景。会检查 length 不超过段内
+u32 字数 * 4，并要求填充区全为 0，避免长度与段内容不一致时静默返回错误数据。
+*/
+read_data_exact_len :: proc(e: ^Encoder, key: string, length: int) -> (data: []u8, ok: bool) {
+	head, valid := eval(e.cache[:], key)
+	if !valid {
+		return nil, false
+	}
+	return read_segment_exact(e.cache[:], key, int(head), length)
+}
+
+/*
+返回 key 的原始字节数（仅当本 Encoder 记录过 add / add_framed 的长度）。
+*/
+data_length :: proc(e: ^Encoder, key: string) -> (length: int, ok: bool) {
+	head, valid := eval(e.cache[:], key)
+	if !valid {
+		return 0, false
+	}
+	length, ok = e.data_lens[head]
+	return length, ok
 }
 
 @(private)
-read_segment_at :: proc(cache: []u32, key: string, head: int) -> (data: []u8, ok: bool) {
+locate_segment :: proc(cache: []u32, key: string, head: int) -> (start, words: int, ok: bool) {
 	if head < 0 || head + 1 >= len(cache) {
-		return nil, false
+		return 0, 0, false
 	}
 
 	switch cache[head] {
 	case 0:
-		return read_segment_legacy(cache, key, head)
+		return locate_segment_legacy(cache, key, head)
 	case FRAME_START:
-		return read_segment_framed(cache, key, head)
+		return locate_segment_framed(cache, key, head)
 	}
-	return nil, false
+	return 0, 0, false
 }
 
 @(private)
-read_segment_legacy :: proc(cache: []u32, key: string, head: int) -> (data: []u8, ok: bool) {
+locate_segment_legacy :: proc(cache: []u32, key: string, head: int) -> (start, words: int, ok: bool) {
 	key_len := int(cache[head + 1])
 	if key_len != len(key) {
-		return nil, false
+		return 0, 0, false
 	}
 	key_words := (key_len + 3) / 4
 	pos := head + 2
 	if pos + key_words >= len(cache) || !packed_key_matches(cache, pos, key) {
-		return nil, false
+		return 0, 0, false
 	}
 	pos += key_words
 
 	if cache[pos] != SEGMENT_SEPARATOR {
-		return nil, false
+		return 0, 0, false
 	}
 	pos += 1
 	if pos >= len(cache) {
-		return nil, false
+		return 0, 0, false
 	}
 	data_words := int(cache[pos])
 	pos += 1
 	if data_words < 0 || pos + data_words > len(cache) {
-		return nil, false
+		return 0, 0, false
 	}
 	end := pos + data_words
 	if end >= len(cache) || cache[end] != SEGMENT_SEPARATOR {
-		return nil, false
+		return 0, 0, false
 	}
-	return unpack_words(cache, pos, data_words), true
+	return pos, data_words, true
 }
 
 @(private)
-read_segment_framed :: proc(cache: []u32, key: string, head: int) -> (data: []u8, ok: bool) {
+locate_segment_framed :: proc(cache: []u32, key: string, head: int) -> (start, words: int, ok: bool) {
 	if head + 2 >= len(cache) || cache[head + 2] != FRAME_KEY {
-		return nil, false
+		return 0, 0, false
 	}
 	key_len := int(cache[head + 1])
 	if key_len != len(key) {
-		return nil, false
+		return 0, 0, false
 	}
 	key_words := (key_len + 3) / 4
 	pos := head + 3
 	if pos + key_words + 3 > len(cache) || !packed_key_matches(cache, pos, key) {
-		return nil, false
+		return 0, 0, false
 	}
 	pos += key_words
 
 	if cache[pos] != FRAME_DATA_LEN {
-		return nil, false
+		return 0, 0, false
 	}
 	data_words := int(cache[pos + 1])
 	pos += 2
 	if cache[pos] != FRAME_DATA {
-		return nil, false
+		return 0, 0, false
 	}
 	pos += 1
 	if data_words < 0 || pos + data_words > len(cache) {
-		return nil, false
+		return 0, 0, false
 	}
 	end := pos + data_words
 	if end >= len(cache) || cache[end] != FRAME_END {
+		return 0, 0, false
+	}
+	return pos, data_words, true
+}
+
+/*
+按原始长度 exact 读取并去掉填充；填充区必须全为 0。
+*/
+@(private)
+read_segment_exact :: proc(cache: []u32, key: string, head, exact: int) -> (data: []u8, ok: bool) {
+	start, words, found := locate_segment(cache, key, head)
+	if !found || exact < 0 || exact > words * 4 {
 		return nil, false
 	}
-	return unpack_words(cache, pos, data_words), true
+	for b in exact ..< words * 4 {
+		word := cache[start + b / 4]
+		if u8((word >> u32((b % 4) * 8)) & 0xFF) != 0 {
+			return nil, false
+		}
+	}
+	out := make([]u8, exact)
+	for b in 0 ..< exact {
+		word := cache[start + b / 4]
+		out[b] = u8((word >> u32((b % 4) * 8)) & 0xFF)
+	}
+	return out, true
 }
 
 /*

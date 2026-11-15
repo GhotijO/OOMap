@@ -115,12 +115,9 @@ test_csv_row :: proc(key: string, data: []u8) -> bool {
 		return false
 	}
 
-	got, read_ok := read_data(&e, key)
+	got, length, read_ok := read_data_exact(&e, key)
 	defer delete(got)
-	if !read_ok {
-		return false
-	}
-	if len(got) < len(data) {
+	if !read_ok || length != len(data) || len(got) != len(data) {
 		return false
 	}
 	for i in 0 ..< len(data) {

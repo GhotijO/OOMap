@@ -1,4 +1,4 @@
-﻿package main
+package oomap
 
 // 64 字符地址编码器 —— wrap 主流程、family 调度、Z3 建模
 //
@@ -47,7 +47,9 @@ wrap :: proc(e: ^Encoder, timeout_ms: u32 = 30_000) -> ErrorCode {
 /*
 wrap 主流程。
 
-timeout_ms 是整个 wrap 的总预算（不是每个 family 各一份）。
+timeout_ms 是协作式总预算（不是每个 family 各一份）：在 family 边界检查剩余时间，
+Z3 求解器内部也设置 timeout；但 Optimize 可能多次调用底层求解器，实际返回时间
+可能明显超过 timeout_ms（见 docs/PERFORMANCE.md）。
 成功时写入 e.cache 并置 frozen=true；失败时 cache 保持不变。
 */
 wrap_ex :: proc(e: ^Encoder, timeout_ms: u32, info: ^WrapInfo) -> ErrorCode {

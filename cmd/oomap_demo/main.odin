@@ -35,6 +35,12 @@ main :: proc() {
 			ok := run_csv_test()
 			fmt.println(ok ? "CSV TEST: PASS" : "CSV TEST: FAIL")
 			os.exit(0 if ok else 1)
+		case "--bench":
+			bench()
+			os.exit(0)
+		case "--bench-z3-stress":
+			bench_z3_stress()
+			os.exit(0)
 		}
 	}
 	demo()

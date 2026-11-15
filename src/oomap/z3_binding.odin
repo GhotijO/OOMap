@@ -1,4 +1,4 @@
-﻿package main
+package oomap
 
 // 64 字符地址编码器 —— Z3 C API 最小子集绑定（运行时动态加载）
 //
@@ -109,6 +109,7 @@ z3_available :: proc() -> bool {
 /*
 强制重新探测（测试用：传非空 override 时只尝试该路径）。
 */
+@(private)
 z3_reset :: proc(override_path: string = "") {
 	sync.mutex_lock(&z3_mutex)
 	defer sync.mutex_unlock(&z3_mutex)

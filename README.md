@@ -9,10 +9,15 @@
 - 64 字符（`.`、`A`..`Z`、`_`、`a`..`z`）的 `u32` 操作编码与精确求解
 - 4 档 family：纯 ADD → ADD/SUB → +XOR → +MOD；逐档尝试并共享总超时
 - `add` / `add_framed` 两种样本写入格式，自动维护 `Entry{key, head}`
-- `verify` 纯 Odin 重放校验；`read_data` 可用求解结果把字符串解码回数据
+- `verify` 纯 Odin 重放校验；`read_data` / `read_data_exact` 可把字符串解码回数据
+  （后者返回原始字节数与去掉填充的 `[]u8`）
+- 可从完整 cache 恢复 `Entry` 与 `Encoder`（`entries_from_cache` /
+  `encoder_from_cache`），便于服务端持久化
+- 可作为第三方 Odin 库导入，见 [docs/LIBRARY.md](docs/LIBRARY.md)
 - Z3 运行时动态加载；缺少 Z3 时 family 0 仍可工作，其余返回 `.MissingZ3`
 - `test.csv` 端到端测试与计时，附 Python 生成器
 - `odin test` 单元测试 + 独立进程验收入口
+- 性能基准与瓶颈分析，见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
 
 ## 快速开始
 
@@ -37,20 +42,43 @@ bin\OOMap.exe
 Demo 会依次执行：`add` 若干样本 → `wrap` → `verify`，最后再跑一个只有 family 3
 （MOD）能解的场景，演示 Z3 路径与缺 Z3 降级。
 
+## 作为第三方库
+
+库包是 `src/oomap`（`package oomap`），Demo 通过相对路径导入它，因此
+`cmd/oomap_demo` 本身就是一个外部调用示例：
+
+```odin
+import oomap "../../src/oomap"
+
+e := oomap.encoder_init()
+defer oomap.encoder_destroy(&e)
+head, err := oomap.add(&e, "A", []u8{0xDE, 0xAD})
+```
+
+完整的 API、所有权、线程安全、持久化和“禁止外部调用”的清单见
+[docs/LIBRARY.md](docs/LIBRARY.md)。
+
 ## 目录
 
 ```
 OOMap/
-├── src/
-│   ├── encoder.odin        Entry / Encoder / add / add_framed / cache 布局
-│   ├── eval.odin           Σ、char_index、apply、eval、verify、read_data
+├── src/oomap/              库包（package oomap）
+│   ├── encoder.odin        Entry / Encoder / add / add_framed / cache 布局 / 恢复
+│   ├── eval.odin           Σ、char_index、eval、verify、read_data / read_data_exact
 │   ├── wrap.odin           wrap 主流程、family 调度、Z3 建模
 │   ├── wrap_pure.odin      family 0：纯 Odin 线性求解
 │   ├── wrap_pure_kernel.odin  family 0 的核空间提升补充求解器
 │   ├── z3_binding.odin     Z3 C API 子集（core:dynlib 运行时加载）
-│   ├── csv_test.odin       test.csv 端到端测试与计时
-│   ├── tests.odin          odin test 验收测试（family 0 / 回读相关）
-│   └── main.odin           demo 与独立进程验收入口
+│   └── tests.odin          odin test 验收测试
+├── cmd/oomap_demo/         demo、独立进程验收、CSV 测试、性能基准（package main）
+│   ├── main.odin
+│   ├── csv_test.odin
+│   ├── bench.odin
+│   └── compat.odin         把库 API 绑定到 demo 名字的外部调用示例
+├── examples/basic/         最小第三方调用示例（限定名调用）
+├── docs/
+│   ├── LIBRARY.md          第三方库调用说明与禁止调用清单
+│   └── PERFORMANCE.md      性能基准与瓶颈分析
 ├── lib/                    Z3 头文件与许可证（DLL 由 fetch 脚本下载）
 ├── scripts/fetch_z3.ps1        下载 Z3 5.3.3 预编译二进制到 lib/
 ├── scripts/run_acceptance.ps1  一键跑完整验收
@@ -132,15 +160,38 @@ read_data :: proc(e: ^Encoder, key: string) -> (data: []u8, ok: bool)
 `add`（`0x0000/0xFFFF`）与 `add_framed`（`0xFF00FFxx`）写入的段都支持。
 返回的 `data` 由调用方 `delete`。
 
-## 从 cache 还原 Entry
+### 精确字节回读 read_data_exact
+
+```odin
+read_data_exact :: proc(e: ^Encoder, key: string) -> (data: []u8, length: int, ok: bool)
+data_length    :: proc(e: ^Encoder, key: string) -> (length: int, ok: bool)
+read_data_exact_len :: proc(e: ^Encoder, key: string, length: int) -> (data: []u8, ok: bool)
+```
+
+`read_data` 返回按 4 字节对齐的数据，长度会多出 0~3 个填充字节。
+`read_data_exact` 去掉填充，`length` 就是 `add` / `add_framed` 时传入的原始
+字节数；原始末尾的 `0x00` 不会被误删。
+
+原始长度不写进 cache：两种段格式只记录 `u32` 字数。因此 `read_data_exact`
+依赖 Encoder 在 `add` / `add_framed` 时记录的内存表：
+
+- 同一个 Encoder 上（wrap 前后）可直接用；
+- 用 `encoder_from_cache` 从 cache 恢复后，长度表为空，`read_data_exact`
+  返回 `ok=false`；
+- 此时如果调用方另存了长度，用 `read_data_exact_len`；它会校验长度不超过
+  段内字数 × 4，并要求填充区全为 0。
+
+## 从 cache 还原 Entry / Encoder
 
 ```odin
 entries_from_cache :: proc(cache: []u32) -> (entries: [dynamic]Entry, err: ErrorCode)
+encoder_from_cache :: proc(cache: []u32) -> (e: Encoder, err: ErrorCode)
+cache_view         :: proc(e: ^Encoder) -> []u32
 ```
 
-从 `cache[256]`（`RESERVED_LEN`）开始顺序解析数据段，支持两种段格式，遇到
-段间 0 填充会跳过；成功时返回新建的 `[dynamic]Entry`，每个 `Entry.head` 就是
-该段起始下标。返回的 `Entry.key` 是新分配的，调用方需要：
+`entries_from_cache` 从 `cache[256]`（`RESERVED_LEN`）开始顺序解析数据段，支持
+两种段格式，遇到段间 0 填充会跳过；成功时返回新建的 `[dynamic]Entry`，每个
+`Entry.head` 就是该段起始下标。返回的 `Entry.key` 是新分配的，调用方需要：
 
 ```odin
 entries, err := entries_from_cache(cache)
@@ -148,6 +199,10 @@ entries, err := entries_from_cache(cache)
 for entry in entries { delete(entry.key) }
 delete(entries)
 ```
+
+`encoder_from_cache` 复制整份 cache 并恢复 Entries，返回的 Encoder 处于
+`frozen` 状态；`cache_view` 返回只读切片，用于保存/序列化。原始长度仍需
+调用方另行保存，见上一节。
 
 ## 关于把 wrap 结果放进固定大小数组
 
@@ -177,9 +232,10 @@ solution_snapshot :: proc(e: ^Encoder) -> []u32
 | 2 | {ADD, SUB, XOR} | Z3 Solver |
 | 3 | {ADD, SUB, XOR, MOD} | Z3 **Optimize**（最小化 Σ\|param\|，再最小化 Σmode） |
 
-`wrap` 从 family 0 到 3 依次尝试，共享同一个总超时预算；每档候选解先写到工作
-缓冲区，`verify` 通过后才一次性写入 `e.cache` 并置 `frozen=true`。任何失败都不
-修改 cache。
+`wrap` 从 family 0 到 3 依次尝试，共享同一个协作式总超时预算；每档候选解先写到
+工作缓冲区，`verify` 通过后才一次性写入 `e.cache` 并置 `frozen=true`。任何失败都
+不修改 cache。超时不是硬实时：Z3 `Optimize` 可能超出预算，见
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 ## Z3 的获取与加载
 
@@ -198,8 +254,8 @@ family 0 继续工作，family 1..3 返回 `.MissingZ3` 并提示“安装 Z3 �
 ## 测试与验收
 
 ```powershell
-# 单元测试（格式、回读、快照、不可行、边界、回绕、frozen）
-odin test src
+# 单元测试（格式、回读、精确长度、快照、cache 恢复、不可行、边界、回绕、frozen）
+odin test src/oomap
 
 # 往返 / 性能（family 0）
 bin\OOMap.exe --check-pure
@@ -207,7 +263,13 @@ bin\OOMap.exe --check-pure
 # family 3 最小 |p| 与超时
 bin\OOMap.exe --check-z3
 
-# test.csv 端到端（add -> wrap -> verify -> read_data）
+# 性能基准（另见 docs/PERFORMANCE.md）
+bin\OOMap.exe --bench
+
+# 128 条只有 MOD 可解的压力场景（可能远超 timeout_ms）
+bin\OOMap.exe --bench-z3-stress
+
+# test.csv 端到端（add -> wrap -> verify -> read_data_exact）
 python scripts\gen_test_csv.py
 bin\OOMap.exe --test-csv
 
@@ -238,8 +300,8 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 ```
 
 每行的 head 由一组隐藏参数决定，程序先把 cache 填充到该位置再 `add`，因此
-`wrap` 必须真正求出能把字符串映射到段起点的参数；随后 `read_data` 再解码并
-与原始数据逐字节比对。
+`wrap` 必须真正求出能把字符串映射到段起点的参数；随后 `read_data_exact` 再解码并
+与原始数据逐字节比对（长度也必须一致）。
 
 | 原始任务规格 第 11 节 | 覆盖方式 |
 |------|------|
@@ -254,9 +316,12 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 | 9 性能（1000 条 < 1 s） | `--check-pure`，本机约 1–3 ms |
 | 10 多解最小 \|p\| | `--check-z3`（MOD 最小解 p=4） |
 | 附加：数据回读 | `odin test`：`test_read_data`（两种段格式 + 错误字符串） |
+| 附加：精确字节回读 | `odin test`：`test_read_data_exact`（含尾随 0、0 长度、无长度元数据） |
 | 附加：从 cache 还原 Entry | `odin test`：`test_entries_from_cache` |
+| 附加：从 cache 还原 Encoder | `odin test`：`test_encoder_from_cache`（frozen / 长度缺失） |
 | 附加：固定数组快照 | `odin test`：`test_solution_snapshot` |
 | 附加：CSV 端到端 | `--test-csv`（配合 `scripts/gen_test_csv.py`） |
+| 附加：性能基准 | `--bench`，结果与分析见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
 
 关于 `odin test`：Windows 上的 Odin 测试运行器会安装 Vectored Exception Handler，
 而 Z3 内部会使用 SEH/C++ 异常做控制流，二者相遇会把正常调用误判成测试信号。
@@ -290,14 +355,17 @@ CSV: rows=200 passed=200 failed=0 elapsed=861.8ms avg=4.31ms
 - 目前只在 Windows x64 + Odin `dev-2026-10-nightly` + Z3 5.3.3 上实测；Linux/macOS
   的加载路径已写好（`libz3.so` / `libz3.dylib`），但未在真机验证。
 - `verify` 只做语义校验（mode ∈ 0..3），不校验 family 归属，符合第 8 节约定。
-- 超时预算只在 family 边界检查；family 0 是同步求解，极端大的输入可能在返回
-  `.Timeout` 前多跑一点时间。
-- 两种段格式都只记录 `u32` 字数，不记录原始字节数，因此 `read_data` 返回的是
-  4 字节对齐的数据（末位带补 0），无法区分原始末尾的 0 与填充。
+- 超时预算只在 family 边界检查；family 0 是同步求解，Z3 `Optimize` 也可能在
+  `timeout_ms` 之后才返回（实测 128 条样本、10 s 预算约 57.9 s 才结束），不能
+  当作硬实时保证；详见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+- 两种段格式都只记录 `u32` 字数，不记录原始字节数。`read_data_exact` 的精确
+  长度依赖 Encoder 的内存表；从 cache 恢复后必须用 `read_data_exact_len`，或
+  由调用方自己保存长度。`read_data` 仍返回 4 字节对齐的数据（末位补 0）。
 - `entries_from_cache` 从 256 开始顺序扫描，允许段间 0 填充；但遇到损坏的非零
   段标记会返回 `.InternalError`，不保证从任意垃圾数据中恢复。
 - family 1/2 为性能使用普通 `Solver`（不做最小化），最小 `Σ|param|` 只在
-  family 3 的 `Optimize` 路径保证。
+  family 3 的 `Optimize` 路径保证。family 1 在可满足性上与 family 0 等价，主要
+  是 family 0 求解器失败后的另一条搜索路径。
 
 ## 仓库约定
 

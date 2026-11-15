@@ -1,5 +1,5 @@
 ﻿# Acceptance runner for OOMap (原始任务规格 section 11).
-# 1. odin test src                -> format / infeasible / boundaries / wrap-around / frozen
+# 1. odin test src/oomap          -> format / infeasible / boundaries / wrap-around / frozen / readback
 # 2. encoder --check-pure         -> roundtrip (5/20/64/65/1000) and 1000-entry performance
 # 3. encoder --check-z3           -> family 3 minimal |p| and 100ms timeout
 # 4. encoder --check-missing-z3   -> degradation after hiding libz3.dll
@@ -27,12 +27,18 @@ function Step($name, $scriptBlock) {
 try {
     Step 'build' {
         if (-not (Get-Command odin -ErrorAction SilentlyContinue)) { throw 'odin not found in PATH' }
-        & odin build src -out:bin\OOMap.exe
+        & odin build cmd\oomap_demo -out:bin\OOMap.exe
         if (Test-Path lib\*.dll) { Copy-Item lib\*.dll bin\ -Force }
     }
 
-    Step 'odin test src' {
-        & odin test src
+    Step 'odin test src/oomap' {
+        & odin test src/oomap
+    }
+
+    Step 'library example (examples/basic)' {
+        & odin build examples/basic -out:bin\oomap_example.exe
+        if ($LASTEXITCODE -ne 0) { throw "example build exit code $LASTEXITCODE" }
+        & .\bin\oomap_example.exe
     }
 
     Step 'roundtrip + performance (--check-pure)' {

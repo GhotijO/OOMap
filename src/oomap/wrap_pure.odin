@@ -1,4 +1,4 @@
-﻿package main
+package oomap
 
 
 // 64 字符地址编码器 —— family 0：纯 Odin 线性求解
@@ -19,6 +19,7 @@
 成功时返回全部 64 个字符的 mode/param（未出现的字符 param=0, mode=0），
 不修改 Encoder；失败时返回 ok=false。
 */
+@(private)
 pure_solve :: proc(e: ^Encoder) -> (ok: bool, modes: [CHAR_COUNT]u32, params: [CHAR_COUNT]u32) {
 	n := len(e.entries)
 	if n == 0 {

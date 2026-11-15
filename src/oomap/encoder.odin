@@ -1,4 +1,4 @@
-package main
+package oomap
 
 // 64 字符地址编码器 —— 数据结构与 add 接口
 //
@@ -26,7 +26,11 @@ Entry :: struct {
 Encoder :: struct {
 	cache:   [dynamic]u32, // 初始长度 256，全 0
 	entries: [dynamic]Entry,
-	frozen:  bool,
+	// add / add_framed 写入的原始字节数，键是段起点 head。
+	// 两种段格式本身只记录 u32 字数，原始长度只存在于这个内存表中；
+	// 从 cache 重新构造 Encoder 时无法恢复，见 read_data_exact。
+	data_lens: map[u32]int,
+	frozen:    bool,
 }
 
 // 保留区布局（cache[0..255]）
@@ -55,6 +59,7 @@ encoder_init :: proc() -> Encoder {
 		e.cache[i] = 0
 	}
 	e.entries = make([dynamic]Entry)
+	e.data_lens = make(map[u32]int)
 	return e
 }
 
@@ -66,6 +71,7 @@ encoder_destroy :: proc(e: ^Encoder) {
 		delete(entry.key)
 	}
 	delete(e.entries)
+	delete(e.data_lens)
 	delete(e.cache)
 	e^ = Encoder{}
 }
@@ -125,6 +131,7 @@ add :: proc(e: ^Encoder, key: string, data: []u8) -> (head: u32, err: ErrorCode)
 
 	key_copy, _ := strings.clone(key)
 	append(&e.entries, Entry{key = key_copy, head = head})
+	e.data_lens[head] = len(data)
 	return head, .None
 }
 
@@ -188,6 +195,7 @@ add_framed :: proc(e: ^Encoder, key: string, data: []u8) -> (head: u32, err: Err
 
 	key_copy, _ := strings.clone(key)
 	append(&e.entries, Entry{key = key_copy, head = head})
+	e.data_lens[head] = len(data)
 	return head, .None
 }
 
@@ -216,6 +224,44 @@ check_addable :: proc(e: ^Encoder, key: string) -> ErrorCode {
 }
 
 /*
+从一份完整的 cache 复制构造 Encoder。
+
+用于把之前保存的 cache 重新加载：Entries 由 entries_from_cache 恢复，
+所以 verify / read_data / read_data_exact_len 可用；但 add / add_framed 记录的
+原始字节数不在 cache 里，read_data_exact 会失败（需要调用方另行保存长度）。
+
+返回的 Encoder 初始为 frozen（cache 对应的解已经存在），需要继续追加样本时
+请重新构造，不要绕过 frozen 直接改 cache。
+*/
+encoder_from_cache :: proc(cache: []u32) -> (e: Encoder, err: ErrorCode) {
+	if len(cache) < RESERVED_LEN {
+		return Encoder{}, .InternalError
+	}
+	entries, parse_err := entries_from_cache(cache)
+	if parse_err != .None {
+		return Encoder{}, parse_err
+	}
+
+	e = encoder_init()
+	delete(e.cache)
+	delete(e.entries)
+	e.cache = make([dynamic]u32, len(cache))
+	copy(e.cache[:], cache)
+	e.entries = entries
+	e.frozen = true
+	return e, .None
+}
+
+/*
+只读视图：返回 cache 的切片，供保存/序列化使用。
+
+调用方不得修改返回的切片，也不得在 Encoder 生命周期结束后继续持有它。
+*/
+cache_view :: proc(e: ^Encoder) -> []u32 {
+	return e.cache[:]
+}
+
+/*
 从 cache（[]u32）中还原出 Entry 列表。
 
 从 cache[RESERVED_LEN] 开始顺序解析；支持 add 的 0x0000/0xFFFF 段与
@@ -225,7 +271,8 @@ add_framed 的 0xFF00FFxx 段，遇到 0 填充会跳过。返回的 Entry.key �
 entries_from_cache :: proc(cache: []u32) -> (entries: [dynamic]Entry, err: ErrorCode) {
 	entries = make([dynamic]Entry)
 	if len(cache) < RESERVED_LEN {
-		return entries, .InternalError
+		delete(entries)
+		return nil, .InternalError
 	}
 
 	pos := RESERVED_LEN
@@ -239,6 +286,7 @@ entries_from_cache :: proc(cache: []u32) -> (entries: [dynamic]Entry, err: Error
 				// 段间 0 填充
 				pos += 1
 			} else {
+				free_entry_list(&entries)
 				return entries, .InternalError
 			}
 		case FRAME_START:

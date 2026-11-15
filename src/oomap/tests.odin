@@ -1,4 +1,4 @@
-package main
+package oomap
 
 // 64 字符地址编码器 —— 验收测试
 //
@@ -414,10 +414,177 @@ test_frozen :: proc(t: ^testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 8. 缺 Z3
+// ---------------------------------------------------------------- 8. 精确字节回读
+
+@(test)
+test_read_data_exact :: proc(t: ^testing.T) {
+	cases := [][]u8{
+		{},
+		{0x00},
+		{0x11},
+		{0x11, 0x00},
+		{0x11, 0x22, 0x33},
+		{0x11, 0x22, 0x33, 0x44},
+		{0x00, 0x00, 0x00, 0x00, 0x00}, // 原始数据自带尾随 0，不能被当成填充
+	}
+
+	for data, i in cases {
+		e := encoder_init()
+		target := u32(300 + i * 20)
+		for len(e.cache) < int(target) {
+			append(&e.cache, 0)
+		}
+		head: u32
+		add_err: ErrorCode
+		if i % 2 == 1 {
+			head, add_err = add_framed(&e, "A", data)
+		} else {
+			head, add_err = add(&e, "A", data)
+		}
+		testing.expect_value(t, add_err, ErrorCode.None)
+		testing.expect_value(t, head, target)
+
+		info: WrapInfo
+		wrap_err := wrap_ex(&e, 5_000, &info)
+		wrap_info_destroy(&info)
+		testing.expect_value(t, wrap_err, ErrorCode.None)
+
+		got, length, ok := read_data_exact(&e, "A")
+		defer delete(got)
+		testing.expectf(t, ok, "case %d 精确回读失败", i)
+		testing.expect_value(t, length, len(data))
+		testing.expect_value(t, len(got), len(data))
+		for b in 0 ..< len(data) {
+			testing.expect_value(t, got[b], data[b])
+		}
+
+		// data_length 与 exact 一致；read_data 仍返回 4 字节对齐的数据。
+		known, known_ok := data_length(&e, "A")
+		testing.expect_value(t, known_ok, true)
+		testing.expect_value(t, known, len(data))
+
+		padded, padded_ok := read_data(&e, "A")
+		defer delete(padded)
+		testing.expect(t, padded_ok)
+		testing.expect_value(t, len(padded), ((len(data) + 3) / 4) * 4)
+		for b in 0 ..< len(data) {
+			testing.expect_value(t, padded[b], data[b])
+		}
+		for b in len(data) ..< len(padded) {
+			testing.expect_value(t, padded[b], u8(0))
+		}
+
+		// 长度超过段内字数 * 4 时必须失败。
+		too_long, too_long_ok := read_data_exact_len(&e, "A", len(padded) + 1)
+		testing.expect(t, !too_long_ok)
+		testing.expect_value(t, len(too_long), 0)
+		delete(too_long)
+
+		encoder_destroy(&e)
+	}
+}
+
+@(test)
+test_read_data_exact_without_length_metadata :: proc(t: ^testing.T) {
+	// 先用 add + wrap 生成一份完整 cache。
+	src := encoder_init()
+	defer encoder_destroy(&src)
+	data := []u8{0xDE, 0xAD, 0xBE, 0xEF, 0x01}
+	for len(src.cache) < 320 {
+		append(&src.cache, 0)
+	}
+	_, add_err := add(&src, "A", data)
+	testing.expect_value(t, add_err, ErrorCode.None)
+
+	info: WrapInfo
+	wrap_err := wrap_ex(&src, 5_000, &info)
+	wrap_info_destroy(&info)
+	testing.expect_value(t, wrap_err, ErrorCode.None)
+
+	// 只从 cache 重建 Encoder：entries 可以恢复，但原始长度不可恢复。
+	restored := encoder_init()
+	defer encoder_destroy(&restored)
+	delete(restored.cache)
+	restored.cache = make([dynamic]u32, len(src.cache))
+	copy(restored.cache[:], src.cache[:])
+
+	entries, entries_err := entries_from_cache(restored.cache[:])
+	testing.expect_value(t, entries_err, ErrorCode.None)
+	testing.expect_value(t, len(entries), 1)
+	for entry in entries {
+		append(&restored.entries, entry)
+	}
+	delete(entries)
+
+	_, _, exact_ok := read_data_exact(&restored, "A")
+	testing.expect(t, !exact_ok)
+
+	got, ok := read_data_exact_len(&restored, "A", len(data))
+	defer delete(got)
+	testing.expect(t, ok)
+	testing.expect_value(t, len(got), len(data))
+	for b in 0 ..< len(data) {
+		testing.expect_value(t, got[b], data[b])
+	}
+}
+
+// ---------------------------------------------------------------- 9. 缺 Z3
 //
 // 说明：Z3 的动态库探测是进程级全局状态（z3_reset 会强制重载），
 // 与 odin test 默认的多线程测试并发执行会互相干扰，因此“缺 Z3 降级”
 // 由 scripts\test_missing_z3.ps1 以独立进程方式验证（隐藏 libz3.dll 后运行 demo）。
 
 
+
+// ---------------------------------------------------------------- 10. cache 往返
+
+@(test)
+test_encoder_from_cache :: proc(t: ^testing.T) {
+	src := encoder_init()
+	defer encoder_destroy(&src)
+
+	for len(src.cache) < 300 {
+		append(&src.cache, 0)
+	}
+	_, e1 := add(&src, "A", []u8{0x10, 0x20, 0x30})
+	testing.expect_value(t, e1, ErrorCode.None)
+	_, e2 := add_framed(&src, "B", []u8{0x40, 0x50})
+	testing.expect_value(t, e2, ErrorCode.None)
+
+	info: WrapInfo
+	wrap_err := wrap_ex(&src, 5_000, &info)
+	wrap_info_destroy(&info)
+	testing.expect_value(t, wrap_err, ErrorCode.None)
+
+	snapshot := make([]u32, len(src.cache))
+	defer delete(snapshot)
+	copy(snapshot, cache_view(&src))
+
+	restored, err := encoder_from_cache(snapshot)
+	defer encoder_destroy(&restored)
+	testing.expect_value(t, err, ErrorCode.None)
+	testing.expect_value(t, len(restored.entries), 2)
+
+	verify_ok, _ := verify(&restored)
+	testing.expect(t, verify_ok)
+
+	got, read_ok := read_data(&restored, "A")
+	defer delete(got)
+	testing.expect(t, read_ok)
+	testing.expect_value(t, len(got), 4)
+	testing.expect_value(t, got[0], u8(0x10))
+	testing.expect_value(t, got[1], u8(0x20))
+	testing.expect_value(t, got[2], u8(0x30))
+
+	// 长度元数据没有随 cache 保存。
+	_, _, exact_ok := read_data_exact(&restored, "A")
+	testing.expect(t, !exact_ok)
+	exact, exact_len_ok := read_data_exact_len(&restored, "A", 3)
+	defer delete(exact)
+	testing.expect(t, exact_len_ok)
+	testing.expect_value(t, len(exact), 3)
+
+	// 恢复出来的 Encoder 已 frozen。
+	_, add_err := add(&restored, "C", nil)
+	testing.expect_value(t, add_err, ErrorCode.Frozen)
+}
